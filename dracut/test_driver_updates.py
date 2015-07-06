@@ -325,7 +325,6 @@ class ExtractDriversTestCase(unittest.TestCase):
     @mock.patch("driver_updates.dd_extract")
     def test_repo(self, mock_extract, mock_append, mock_save):
         """extract_drivers: save repo, write pkglist"""
-        repo = fake_module.repo
         extract_drivers([fake_enhancement, fake_module])
         # extracts all listed modules
         mock_extract.assert_has_calls([

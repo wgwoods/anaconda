@@ -156,15 +156,11 @@ def umount(mnt):
 
 @contextmanager
 def mounted(dev, mnt=None):
-    try:
-        mnt = mount(dev, mnt)
-    except subprocess.CalledProcessError as e:
-        log.error("failed to mount %s: %s", dev, str(e))
-        mnt = None
+    mnt = mount(dev, mnt)
     try:
         yield mnt
     finally:
-        if mnt: umount(mnt)
+        umount(mnt)
 
 module_updates_dir = '/lib/modules/%s/updates' % os.uname()[2]
 firmware_updates_dir = '/lib/firmware/updates'
@@ -273,8 +269,6 @@ def process_driver_disk(dev, interactive=False):
     or ask which iso file to process (if no repos).
     """
     with mounted(dev) as mnt:
-        if not mnt:
-            return
         log.info("Examining %s", dev)
         repos = find_repos(mnt)
         isos = find_isos(mnt)
@@ -529,9 +523,14 @@ def main(args):
     elif args[0] == '--interactive':
         request = 'menu'
         while True:
-            dev = device_menu()
-            if not dev: break
-            process_driver_disk(dev.pop().device, interactive=True)
+            try:
+                dev = device_menu()
+                if not dev: break
+                process_driver_disk(dev.pop().device, interactive=True)
+            except (subprocess.CalledProcessError, IOError) as e:
+                log.error("ERROR: %s", e)
+            except KeyboardInterrupt:
+                break
 
     finish(request)
 
