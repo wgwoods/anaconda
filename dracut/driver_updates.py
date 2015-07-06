@@ -140,14 +140,12 @@ def dd_extract(rpm_path, outdir, kernel_ver=None, flags='-blmf'):
     cmd = ["dd_extract", flags, '-r', rpm_path, '-d', outdir, '-k', kernel_ver]
     subprocess.check_output(cmd, stderr=subprocess.DEVNULL) # discard stdout
 
-# TODO: automatically add "-o loop" if dev is an .iso file
-#       (and then clean that nonsense up in our callers)
-def mount(dev, mnt=None, options=None):
+def mount(dev, mnt=None):
+    """Mount the given dev at the mountpoint given by mnt."""
+    # NOTE: dev may be a filesystem image - "-o loop" is not necessary anymore
     if not mnt:
         mnt = mkdir_seq("/media/DD-")
     cmd = ["mount", dev, mnt]
-    if options:
-        cmd += ["-o", options]
     log.debug("mounting %s at %s", dev, mnt)
     subprocess.check_call(cmd)
     return mnt
@@ -157,10 +155,16 @@ def umount(mnt):
     subprocess.call(["umount", mnt])
 
 @contextmanager
-def mounted(dev, mnt=None, options=None):
-    mnt = mount(dev, mnt, options)
-    yield mnt
-    umount(dev)
+def mounted(dev, mnt=None):
+    try:
+        mnt = mount(dev, mnt)
+    except subprocess.CalledProcessError as e:
+        log.error("failed to mount %s: %s", dev, str(e))
+        mnt = None
+    try:
+        yield mnt
+    finally:
+        if mnt: umount(mnt)
 
 module_updates_dir = '/lib/modules/%s/updates' % os.uname()[2]
 firmware_updates_dir = '/lib/firmware/updates'
@@ -210,19 +214,33 @@ def save_repo(repo, target="/run/install"):
     subprocess.call(["cp", "-arT", repo, newdir])
     return newdir
 
-# FIXME: move pkglist stuff to dd_extract (to share with interactive mode)
-#        or add a "selected" keyword arg
-def extract_repo(repo, outdir="/updates", pkglist="/run/install/dd_packages"):
+def extract_drivers(drivers=None, repos=None, outdir="/updates",
+                    pkglist="/run/install/dd_packages"):
     """
-    extract all matching RPMs from the repo into outdir.
-    also, write the name of any package containing modules or firmware
-    into pkglist.
+    Extract drivers - either a user-selected driver list or full repos.
+
+    drivers should be a list of Drivers to extract, or None.
+    repos should be a list of repo paths to extract, or None.
+    (If both are empty, nothing happens..)
+
+    If any packages containing modules or firmware are extracted, also:
+    * call save_repo for that package's repo
+    * write the package name(s) to pkglist.
     """
-    for driver in dd_list(repo):
+    if not drivers:
+        drivers = []
+    if repos:
+        drivers += [d for d in dd_list(repo) for repo in repos]
+    save_repos = set()
+    for driver in drivers:
         dd_extract(driver.source, outdir)
         # Make sure we install modules/firmware into the target system
         if 'modules' in driver.flags or 'firmwares' in driver.flags:
             append_line(pkglist, driver.name)
+            save_repos.add(driver.repo)
+    # save the repos containing those packages
+    for repo in save_repos:
+        save_repo(repo)
 
 def grab_driver_files(outdir="/updates"):
     """
@@ -243,27 +261,41 @@ def load_drivers(modnames):
     subprocess.call(["depmod", "-a"])
     subprocess.call(["modprobe", "-a"] + modnames)
 
-def process_driver_disk(dd_dev, mount_opts=None):
-    with mounted(dd_dev, options=mount_opts) as mnt:
-        # FIXME: fix behavior/policy difference vs. interactive
-        for repo in find_repos(mnt):
-            save_repo(repo)
-            extract_repo(repo)
-        for iso in find_isos(mnt):
-            process_driver_disk(iso, mount_opts="loop")
+def process_driver_disk(dev, interactive=False):
+    """
+    Main entry point for processing a single driver disk.
+    Mount the device/image, find repos, and install drivers from those repos.
 
-def setup_log():
-    log.setLevel(logging.DEBUG)
-    handler = SysLogHandler(address="/dev/log")
-    log.addHandler(handler)
-    handler = logging.StreamHandler()
-    handler.setLevel(logging.INFO)
-    formatter = logging.Formatter("DD: %(message)s")
-    handler.setFormatter(formatter)
-    log.addHandler(handler)
+    If there are no repos, look for .iso files, and (if present) recursively
+    process those.
+
+    If interactive, ask the user which driver(s) to install from the repos,
+    or ask which iso file to process (if no repos).
+    """
+    with mounted(dev) as mnt:
+        if not mnt:
+            return
+        log.info("Examining %s", dev)
+        repos = find_repos(mnt)
+        isos = find_isos(mnt)
+
+        if repos:
+            if interactive:
+                extract_drivers(drivers=repo_menu(repos))
+            else:
+                extract_drivers(repos=repos)
+            modules = grab_driver_files()
+            load_drivers(modules)
+        elif isos:
+            if interactive:
+                isos = iso_menu(isos)
+            for iso in isos:
+                process_driver_disk(iso, interactive=interactive)
+        else:
+            print("=== No driver disks found in %s! ===\n" % dev)
 
 def mark_finished(user_request, topdir="/tmp"):
-    log.debug("marking %s complete", user_request)
+    log.debug("marking %s complete in %s", user_request, topdir)
     append_line(topdir+"/dd_finished", user_request)
 
 def all_finished(topdir="/tmp"):
@@ -271,36 +303,60 @@ def all_finished(topdir="/tmp"):
     todo = read_lines(topdir+"/dd_todo")
     return set(finished) == set(todo)
 
-def handle_dd(mode, user_request, dd_dev):
-    # either URL LOCALFILE or DISKSTR DEVICENODE
-    log.debug("%s: '%s' found at %s", mode, user_request, dd_dev)
-    # Process the DD we were given
-    if dd_dev.startswith("/dev"):
-        process_driver_disk(dd_dev)
-    else:
-        process_driver_disk(dd_dev, mount_opts="loop")
-    # Set up new modules and mark this finished
-    finish(user_request)
-
-def finish(user_request):
-    # copy drivers into the running environment
-    modules = grab_driver_files()
-    # try to load 'em all
-    load_drivers(modules)
+def finish(user_request, topdir="/tmp"):
     # mark that we've finished processing this request
-    mark_finished(user_request)
+    mark_finished(user_request, topdir)
     # if we're done now, let dracut know
-    if all_finished():
-        append_line("/tmp/dd.done", "true")
+    if all_finished(topdir):
+        append_line(topdir+"/dd.done", "true")
 
-# --- ALL THE INTERACTIVE MENU JUNK IS BELOW HERE ----------------
+# --- DEVICE LISTING HELPERS FOR THE MENU -----------------------------------
+
+class DeviceInfo(object):
+    def __init__(self, **kwargs):
+        self.device = kwargs.get("DEVNAME", '')
+        self.uuid = kwargs.get("UUID", '')
+        self.fs_type = kwargs.get("TYPE", '')
+        self.label = kwargs.get("LABEL", '')
+
+    def __repr__(self):
+        return '<DeviceInfo %s>' % self.device
+
+    @property
+    def shortdev(self):
+        if os.path.islink(self.device):
+            return os.path.basename(os.readlink(self.device))
+        elif self.device.startswith('/dev/'):
+            return self.device[5:]
+        else:
+            return self.device
+
+def blkid():
+    out = subprocess.check_output("blkid -o export -s UUID -s TYPE".split())
+    out = out.decode('ascii')
+    return [dict(kv.split('=',1) for kv in block.splitlines())
+                                 for block in out.split('\n\n')]
+
+def get_disk_labels():
+    return {os.path.realpath(s):os.path.basename(s)
+            for s in iter_files("/dev/disk/by-label")}
+
+def get_deviceinfo():
+    disk_labels = get_disk_labels()
+    deviceinfo = [DeviceInfo(**d) for d in blkid()]
+    for dev in deviceinfo:
+        dev.label = disk_labels.get(dev.device, '')
+    return deviceinfo
+
+# --- INTERACTIVE MENU JUNK ------------------------------------------------
 
 class TextMenu(object):
-    def __init__(self, items, header=None, formatter=None, refresher=None,
-                        multi=False, page_height=20):
+    def __init__(self, items, title=None, formatter=None, headeritem=None,
+                 refresher=None, multi=False, page_height=20):
         self.items = items
-        self.header = header
+        self.title = title
         self.formatter = formatter
+        self.headeritem = headeritem
         self.refresher = refresher
         self.multi = multi
         self.page_height = page_height
@@ -334,8 +390,8 @@ class TextMenu(object):
     def done(self):
         self.is_done = True
 
-    def invalid(self):
-        print("Invalid selection")
+    def invalid(self, k):
+        print("Invalid selection %r" % k)
 
     def toggle_item(self, item):
         if item in self.selected_items:
@@ -363,9 +419,15 @@ class TextMenu(object):
         for n, i in self.items_on_page():
             if self.multi:
                 x = 'x' if i in self.selected_items else ' '
-                yield "%3d) [%s] %s" % (n+1, x, self.format_item(i))
+                yield "%2d) [%s] %s" % (n+1, x, self.format_item(i))
             else:
-                yield "%3d) %s" % (n+1, self.format_item(i))
+                yield "%2d) %s" % (n+1, self.format_item(i))
+
+    def format_header(self):
+        if self.multi:
+            return '        '+self.format_item(self.headeritem)
+        else:
+            return '    '+self.format_item(self.headeritem)
 
     def action_dict(self):
         actions = {
@@ -374,17 +436,19 @@ class TextMenu(object):
             'p': self.prev,
             'c': self.done,
         }
-        i = None
         for n, i in self.items_on_page():
-            actions[str(n+1)] = lambda: self.toggle_item(i)
+            actions[str(n+1)] = lambda item=i: self.toggle_item(item)
         return actions
 
     def format_page(self):
-        page = '\nPage {pagenum} of {num_pages}\n{header}\n{items}'
+        page = '\n(Page {pagenum} of {num_pages}) {title}\n{items}'
+        items = list(self.format_items())
+        if self.headeritem:
+            items.insert(0, self.format_header())
         return page.format(pagenum=self.pagenum,
                            num_pages=self.num_pages,
-                           header=self.header or '',
-                           items='\n'.join(list(self.format_items())))
+                           title=self.title or '',
+                           items='\n'.join(items))
 
     def format_prompt(self):
         options = [
@@ -400,79 +464,46 @@ class TextMenu(object):
         while not self.is_done:
             print(self.format_page())
             k = input(self.format_prompt())
-            action = self.action_dict().get(k, self.invalid)
-            action()
+            action = self.action_dict().get(k)
+            if action:
+                action()
+            else:
+                self.invalid(k)
         return self.selected_items
 
-class DeviceInfo(object):
-    def __init__(self, **kwargs):
-        self.device = kwargs.get("DEVNAME")
-        self.uuid = kwargs.get("UUID")
-        self.fs_type = kwargs.get("TYPE")
-        self.label = kwargs.get("LABEL")
-
-    def __repr__(self):
-        return '<DeviceInfo %s>' % self.device
-
-    def __str__(self):
-        return '{0.device} {0.fs_type} {0.label} {0.uuid}'.format(self)
-
-def blkid():
-    out = subprocess.check_output("blkid -o export -s UUID -s TYPE".split())
-    out = out.decode('ascii')
-    return [dict(kv.split('=',1) for kv in block.splitlines())
-                                 for block in out.split('\n\n')]
-
-def get_disk_labels():
-    return {os.path.realpath(s):os.path.basename(s)
-            for s in iter_files("/dev/disk/by-label")}
-
-def get_deviceinfo():
-    disk_labels = get_disk_labels()
-    deviceinfo = [DeviceInfo(**d) for d in blkid()]
-    for dev in deviceinfo:
-        dev.label = disk_labels.get(dev.device)
-    return deviceinfo
-
 def repo_menu(repos):
-    """Show a list of drivers, let the user pick some, extract them"""
-    drivers = sum(dd_list(r) for r in repos)
-    menu = TextMenu(drivers, header="DRIVERS", multi=True)
-    requested_drivers = menu.run()
-    for d in requested_drivers:
-        save_repo(d.repo)
-        dd_extract(d.source, "/updates")
+    drivers = [d for r in repos for d in dd_list(r)]
+    menu = TextMenu(drivers, title="Select drivers to install",
+                             formatter=lambda d: d.source,
+                             multi=True)
+    result = menu.run()
+    return result
 
 def iso_menu(isos):
-    """Pick one ISO file and load drivers from its repos"""
-    menu = TextMenu(isos, header="ISOS")
-    for iso in menu.run():
-        dd_menu(iso)
+    menu = TextMenu(isos, title="Choose driver disk ISO file")
+    result = menu.run()
+    return result
 
-def dd_menu(dev):
-    options = "loop" if dev.endswith('.iso') else None
-    with mounted(dev, options) as mnt:
-        repos = find_repos(mnt)
-        isos = find_isos(mnt)
-        if repos:
-            repo_menu(repos)
-        elif isos: # NOTE: old version ignores isos if there's a repo, so..
-            iso_menu(isos)
-        else:
-            print("=== No driver disks found in %s!===\n" % dev)
+def device_menu():
+    fmt = '{0.shortdev:<8.8} {0.fs_type:<8.8} {0.label:<20.20} {0.uuid:<.36}'
+    hdr = DeviceInfo(DEVNAME='DEVICE', TYPE='TYPE', LABEL='LABEL', UUID='UUID')
+    menu = TextMenu(get_deviceinfo, title="Driver disk device selection",
+                                    formatter=fmt.format,
+                                    headeritem=hdr)
+    result = menu.run()
+    return result
 
-def interactive():
-    device_menu = TextMenu(get_deviceinfo, header="HEADER")
-    while True:
-        devlist = device_menu.run()
-        if not devlist:
-            break
-        for dev in devlist:
-            dd_menu(dev.device)
-    # mark this as finished, and do system prep stuff
-    finish('menu')
+# --- COMMANDLINE-TYPE STUFF ------------------------------------------------
 
-# --------------- BELOW HERE IS THE COMMANDLINE-TYPE STUFF ---------------
+def setup_log():
+    log.setLevel(logging.DEBUG)
+    handler = SysLogHandler(address="/dev/log")
+    log.addHandler(handler)
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.INFO)
+    formatter = logging.Formatter("DD: %(message)s")
+    handler.setFormatter(formatter)
+    log.addHandler(handler)
 
 def print_usage():
     print("usage: driver-updates --interactive")
@@ -490,14 +521,20 @@ def check_args(args):
 def main(args):
     if not check_args(args):
         print_usage()
-        return 2
+        raise SystemExit(2)
 
-    if args[0] == '--interactive':
-        interactive()
-    else:
-        handle_dd(*args)
+    if args[0] in ('--disk', '--net'):
+        request, dev = args
+        process_driver_disk(dev)
+    elif args[0] == '--interactive':
+        request = 'menu'
+        while True:
+            dev = device_menu()
+            if not dev: break
+            process_driver_disk(dev.pop().device, interactive=True)
+
+    finish(request)
 
 if __name__ == '__main__':
     setup_log()
-    rv = main(sys.argv[1:])
-    raise SystemExit(rv or 0)
+    main(sys.argv[1:])

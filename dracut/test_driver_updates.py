@@ -228,8 +228,8 @@ from driver_updates import mount, umount, mounted
 class MountTestCase(unittest.TestCase):
     @mock.patch('driver_updates.mkdir_seq')
     @mock.patch('driver_updates.subprocess.check_call')
-    def test_basic(self, check_call, mkdir):
-        """mount: calls mount(8), makes mountpoint if needed"""
+    def test_mkdir(self, check_call, mkdir):
+        """mount: makes mountpoint if needed"""
         dev, mnt = '/dev/fake', '/media/DD-1'
         mkdir.return_value = mnt
         mountpoint = mount(dev)
@@ -239,11 +239,11 @@ class MountTestCase(unittest.TestCase):
 
     @mock.patch('driver_updates.mkdir_seq')
     @mock.patch('driver_updates.subprocess.check_call')
-    def test_options(self, check_call, mkdir):
-        """mount: correctly adds "-o options" if options are added"""
+    def test_basic(self, check_call, mkdir):
+        """mount: calls mount(8) to mount a device/image"""
         dev, mnt = '/dev/fake', '/media/fake'
-        mount(dev, mnt, options="spicy")
-        check_call.assert_called_once_with(["mount", dev, mnt, "-o", "spicy"])
+        mount(dev, mnt)
+        check_call.assert_called_once_with(["mount", dev, mnt])
         self.assertFalse(mkdir.called)
 
     @mock.patch('driver_updates.subprocess.call')
@@ -260,10 +260,10 @@ class MountTestCase(unittest.TestCase):
         dev, mnt = '/dev/fake', '/media/fake'
         mock_mount.return_value = mnt
         with mounted(dev, mnt) as mountpoint:
-            mock_mount.assert_called_once_with(dev, mnt, None)
+            mock_mount.assert_called_once_with(dev, mnt)
             self.assertFalse(mock_umount.called)
             self.assertEqual(mountpoint, mnt)
-        mock_umount.assert_called_once_with(dev)
+        mock_umount.assert_called_once_with(mnt)
 
 # NOTE: dd_list and dd_extract get tested pretty thoroughly in tests/dd_tests,
 # so this is a slightly higher-level test case
@@ -317,25 +317,36 @@ class DDUtilsTestCase(unittest.TestCase):
         self.assertIn("-blmf", cmd)
         self.assertTrue(cmd[0].endswith("dd_extract"))
 
-from driver_updates import extract_repo, grab_driver_files, load_drivers
+from driver_updates import extract_drivers, grab_driver_files, load_drivers
 
-class ExtractRepoTestCase(unittest.TestCase):
+class ExtractDriversTestCase(unittest.TestCase):
+    @mock.patch("driver_updates.save_repo")
     @mock.patch("driver_updates.append_line")
     @mock.patch("driver_updates.dd_extract")
-    @mock.patch("driver_updates.dd_list")
-    def test_basic(self, mock_dd_list, mock_dd_extract, mock_append_line):
-        """extract_repo: extract drivers listed by dd_list and write pkglist"""
-        mock_dd_list.return_value = [fake_enhancement, fake_module]
-        repo = "/some/repo/path"
-        extract_repo(repo)
-        mock_dd_list.assert_called_once_with(repo)
+    def test_repo(self, mock_extract, mock_append, mock_save):
+        """extract_drivers: save repo, write pkglist"""
+        repo = fake_module.repo
+        extract_drivers([fake_enhancement, fake_module])
         # extracts all listed modules
-        mock_dd_extract.assert_has_calls([
+        mock_extract.assert_has_calls([
             mock.call(fake_enhancement.source, "/updates"),
             mock.call(fake_module.source, "/updates")
         ], any_order=True)
         pkglist = "/run/install/dd_packages"
-        mock_append_line.assert_called_once_with(pkglist, fake_module.name)
+        mock_append.assert_called_once_with(pkglist, fake_module.name)
+        mock_save.assert_called_once_with(fake_module.repo)
+
+    @mock.patch("driver_updates.save_repo")
+    @mock.patch("driver_updates.append_line")
+    @mock.patch("driver_updates.dd_extract")
+    def test_drivers(self, mock_extract, mock_append, mock_save):
+        """extract_drivers: extract selected drivers, don't save enhancements"""
+        extract_drivers([fake_enhancement])
+        mock_extract.assert_called_once_with(
+            fake_enhancement.source, "/updates"
+        )
+        self.assertFalse(mock_append.called)
+        self.assertFalse(mock_save.called)
 
 class GrabDriverFilesTestCase(FileTestCaseBase):
     def test_basic(self):
@@ -383,102 +394,67 @@ class ProcessDriverDisk(unittest.TestCase):
     def setUp(self):
         # an iterable that returns fake mountpoints, for mocking mount()
         self.fakemount = ["/mnt/DD-%i" % n for n in range(1,10)]
-        # a function that returns a couple of fake repos, for find_repos()
-        self.fakerepos = lambda m: [m+'/repo1', m+'/repo/2']
-        # a set of directory listings to be returned by os.listdir
-        self.dir_listings = {
-            '/mnt/DD-1': ['README', 'EATME'],
-            '/mnt/DD-2': ['README', 'COPYING'],
-            '/mnt/DD-3': ['Windows95']
+        # an iterable that returns fake repos, for mocking find_repos()
+        self.frepo = {
+            '/mnt/DD-1': ['/mnt/DD-1/repo1'],
+            '/mnt/DD-2': ['/mnt/DD-2/repo1', '/mnt/DD-2/repo2'],
         }
-        listdir = self.dir_listings.get
+        # fake iso listings for iso_dir
+        self.fiso = {
+            '/mnt/DD-1': [],
+            '/mnt/DD-2': [],
+            '/mnt/DD-3': [],
+        }
         # a context-manager object to be returned by the mock mounted()
         mounted_ctx = mock.MagicMock(
             __enter__=mock.MagicMock(side_effect=self.fakemount), # mount
             __exit__=mock.MagicMock(return_value=None),           # umount
         )
+        self.modlist = []
         # set up our patches
         patches = (
             mock.patch("driver_updates.mounted", return_value=mounted_ctx),
-            mock.patch("driver_updates.find_repos", side_effect=self.fakerepos),
-            mock.patch("driver_updates.os.listdir", side_effect=listdir),
-            mock.patch("driver_updates.save_repo"),
-            mock.patch("driver_updates.extract_repo"),
+            mock.patch("driver_updates.find_repos", side_effect=self.frepo.get),
+            mock.patch("driver_updates.find_isos", side_effect=self.fiso.get),
+            mock.patch("driver_updates.extract_drivers"),
+            mock.patch("driver_updates.load_drivers"),
+            mock.patch('driver_updates.grab_driver_files',
+                                side_effect=lambda: self.modlist),
         )
         self.mocks = {p.attribute:p.start() for p in patches}
         for p in patches: self.addCleanup(p.stop)
 
     def test_basic(self):
-        """process_driver_disk: mount a device and extract all its repos"""
+        """process_driver_disk: mount disk, extract RPMs, grab + load drivers"""
         dev = '/dev/fake'
         process_driver_disk(dev)
         # did we mount the initial device, and then the .iso we find therein?
-        self.mocks['mounted'].assert_called_once_with(dev, options=None)
-        allrepos = [mock.call(r) for r in self.fakerepos('/mnt/DD-1')]
-        self.mocks['save_repo'].assert_has_calls(allrepos)
-        self.mocks['extract_repo'].assert_has_calls(allrepos)
+        self.mocks['mounted'].assert_called_once_with(dev)
+        self.mocks['extract_drivers'].assert_called_once_with(repos=self.frepo['/mnt/DD-1'])
+        self.mocks['grab_driver_files'].assert_called_once_with()
+        self.mocks['load_drivers'].assert_called_once_with(self.modlist)
 
     def test_recursive(self):
         """process_driver_disk: recursively process .isos at toplevel"""
         dev = '/dev/fake'
-        self.dir_listings['/mnt/DD-1'].append('magic.iso')
-        self.dir_listings['/mnt/DD-2'].append('another.iso')
+        # first mount has no repos, but an iso
+        self.frepo['/mnt/DD-1'] = []
+        self.fiso['/mnt/DD-1'].append('magic.iso')
+        self.fiso['/mnt/DD-2'].append('ignored.iso')
         process_driver_disk(dev)
-        # did we mount the initial device, and then the .isos we find therein?
+        # did we mount the initial device, and the iso therein?
+        # also: we ignore ignored.iso because magic.iso is a proper DD
         self.mocks['mounted'].assert_has_calls([
-            mock.call(dev, options=None),
-            mock.call('/mnt/DD-1/magic.iso', options="loop"),
-            mock.call('/mnt/DD-2/another.iso', options="loop"),
+            mock.call(dev), mock.call('magic.iso')
         ])
-        mounts = self.fakemount[:2]
-        allrepos = [mock.call(r) for m in mounts for r in self.fakerepos(m)]
-        self.mocks['save_repo'].assert_has_calls(allrepos)
-        self.mocks['extract_repo'].assert_has_calls(allrepos)
-
-from driver_updates import handle_dd
-class HandleDDTestCase(unittest.TestCase):
-    def setUp(self):
-        self.all_finished = False
-        self.modlist = []
-        patches = (
-            mock.patch('driver_updates.process_driver_disk'),
-            mock.patch('driver_updates.load_drivers'),
-            mock.patch('driver_updates.mark_finished'),
-            mock.patch('driver_updates.append_line'),
-            mock.patch('driver_updates.grab_driver_files',
-                                side_effect=lambda: self.modlist),
-            mock.patch('driver_updates.all_finished',
-                                side_effect=lambda: self.all_finished),
-        )
-        self.mocks = {p.attribute:p.start() for p in patches}
-        for p in patches: self.addCleanup(p.stop)
-
-    def test_basic(self):
-        """handle_dd: process, grab + load drivers, check if finished"""
-        diskstr = "LABEL=OEMDRV"
-        dev = "/dev/sr0"
-        self.modlist = ['module', 'anotherone']
-        handle_dd("--disk", diskstr, dev)
-        self.mocks['process_driver_disk'].assert_called_once_with(dev)
+        # we extracted drivers from the repo(s) in magic.iso
+        self.mocks['extract_drivers'].assert_called_once_with(repos=self.frepo['/mnt/DD-2'])
         self.mocks['grab_driver_files'].assert_called_once_with()
         self.mocks['load_drivers'].assert_called_once_with(self.modlist)
-        self.mocks['mark_finished'].assert_called_once_with(diskstr)
-        self.assertFalse(self.mocks['append_line'].called)
 
-    def test_done(self):
-        """handle_dd: check that /tmp/dd.done gets written when finished"""
-        url = "http://some.url/wowzers"
-        iso = "/tmp/download/driver.iso"
-        self.modlist = ['drivers', 'aplenty']
-        self.all_finished = True
-        handle_dd("--net", url, iso)
-        self.mocks['process_driver_disk'].assert_called_once_with(iso, mount_opts="loop")
-        self.mocks['grab_driver_files'].assert_called_once_with()
-        self.mocks['load_drivers'].assert_called_once_with(self.modlist)
-        self.mocks['mark_finished'].assert_called_once_with(url)
-        self.mocks['append_line'].assert_called_once_with("/tmp/dd.done", "true")
+    # TODO: test_interactive
 
-from driver_updates import all_finished, mark_finished
+from driver_updates import finish, mark_finished, all_finished
 
 class FinishedTestCase(FileTestCaseBase):
     def test_mark_finished(self):
@@ -495,10 +471,24 @@ class FinishedTestCase(FileTestCaseBase):
         requests = ['one', 'two', 'final thingy']
         with open(todo, 'w') as outf:
             outf.write(''.join(r+'\n' for r in requests))
+        self.assertEqual(set(read_lines(todo)), set(requests))
         for r in reversed(requests):
             self.assertFalse(all_finished(topdir=self.tmpdir))
             mark_finished(r, topdir=self.tmpdir)
         self.assertTrue(all_finished(topdir=self.tmpdir))
+
+    def test_finish(self):
+        """finish: mark request finished, and write dd.done if all complete"""
+        todo = self.tmpdir+'/dd_todo'
+        done = self.tmpdir+'/dd.done'
+        requests = ['one', 'two', 'final thingy']
+        with open(todo, 'w') as outf:
+            outf.write(''.join(r+'\n' for r in requests))
+        for r in reversed(requests):
+            print("marking %s" % r)
+            self.assertFalse(os.path.exists(done))
+            finish(r, topdir=self.tmpdir)
+        self.assertTrue(os.path.exists(done))
 
 blkid_output = b'''\
 DEVNAME=/dev/sda2
@@ -523,6 +513,7 @@ disk_labels = {
     '/dev/sda3': 'metroid_root'
 }
 from driver_updates import get_deviceinfo
+# also covers blkid, get_disk_labels, DeviceInfo
 class TestDeviceInfo(unittest.TestCase):
     @mock.patch('driver_updates.subprocess.check_output')
     @mock.patch('driver_updates.get_disk_labels')
@@ -542,6 +533,6 @@ class TestDeviceInfo(unittest.TestCase):
         self.assertEqual(loop.label, 'I\\x20\u262d\\x20COMMUNISM')
 
 # yeab bud let's do this... .. .,,,.
-from driver_updates import TextMenu, interactive
+#from driver_updates import TextMenu, interactive
 
 # NOTE: mock out __builtin__.input and we can script this fokker...
