@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python
 #
 # Copyright (C) 2015 by Red Hat, Inc.  All rights reserved.
 #
@@ -68,6 +68,12 @@ import readline # pylint:disable=unused-import
 from contextlib import contextmanager
 from logging.handlers import SysLogHandler
 
+# py2 compat
+try:
+    from subprocess import DEVNULL
+except ImportError:
+    DEVNULL = open("/dev/null", 'a+')
+
 log = logging.getLogger("DD")
 
 arch = os.uname()[4]
@@ -88,7 +94,8 @@ def mkdir_seq(stem):
         dirname = str(stem) + str(n)
         try:
             os.makedirs(dirname)
-        except FileExistsError:
+        except OSError as e:
+            if e.errno != 17: raise
             n += 1
         else:
             return dirname
@@ -126,7 +133,7 @@ def dd_list(dd_path, anaconda_ver=None, kernel_ver=None):
     if not kernel_ver:
         kernel_ver = kernelver
     cmd = ["dd_list", '-d', dd_path, '-k', kernel_ver, '-a', anaconda_ver]
-    out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
+    out = subprocess.check_output(cmd, stderr=DEVNULL)
     out = out.decode('utf-8')
     drivers = [Driver(*d.split('\n',3)) for d in out.split('\n---\n') if d]
     log.debug("dd_list: found drivers: %s", ' '.join(d.name for d in drivers))
@@ -138,7 +145,7 @@ def dd_extract(rpm_path, outdir, kernel_ver=None, flags='-blmf'):
     if not kernel_ver:
         kernel_ver = kernelver
     cmd = ["dd_extract", flags, '-r', rpm_path, '-d', outdir, '-k', kernel_ver]
-    subprocess.check_output(cmd, stderr=subprocess.DEVNULL) # discard stdout
+    subprocess.check_output(cmd, stderr=DEVNULL) # discard stdout
 
 def mount(dev, mnt=None):
     """Mount the given dev at the mountpoint given by mnt."""

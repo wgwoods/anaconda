@@ -1,8 +1,10 @@
-#!/usr/bin/python3
 # test_driver_updates.py - unittests for driver_updates.py
 
 import unittest
-import unittest.mock as mock
+try:
+    import unittest.mock as mock
+except ImportError:
+    import mock
 
 import os
 import tempfile
@@ -13,9 +15,9 @@ from driver_updates import append_line, mkdir_seq
 
 def touch(path):
     try:
-        open(path, 'x')
-    except FileExistsError:
-        pass
+        open(path, 'a')
+    except IOError as e:
+        if e.errno != 17: raise
 
 def makedir(path):
     ensure_dir(path)
@@ -550,8 +552,15 @@ class DeviceInfoTestCase(unittest.TestCase):
 
 # TODO: test TextMenu itself
 
+# py2/3 compat
+import sys
+if sys.version_info.major == 3:
+    from io import StringIO
+else:
+    from io import BytesIO as StringIO
+builtin_input = input.__module__ + '.input'
+
 from driver_updates import device_menu
-from io import StringIO
 class DeviceMenuTestCase(unittest.TestCase):
     def setUp(self):
         patches = (
@@ -562,14 +571,14 @@ class DeviceMenuTestCase(unittest.TestCase):
 
     def test_device_menu_exit(self):
         """device_menu: 'c' exits the menu"""
-        with mock.patch('builtins.input', side_effect=['c']):
+        with mock.patch(builtin_input, side_effect=['c']):
             dev = device_menu()
         self.assertEqual(dev, [])
         self.assertEqual(self.mocks['get_deviceinfo'].call_count, 1)
 
     def test_device_menu_refresh(self):
         """device_menu: 'r' makes the menu refresh"""
-        with mock.patch('builtins.input', side_effect=['r','c']):
+        with mock.patch(builtin_input, side_effect=['r','c']):
             device_menu()
         self.assertEqual(self.mocks['get_deviceinfo'].call_count, 2)
 
@@ -577,7 +586,7 @@ class DeviceMenuTestCase(unittest.TestCase):
     def test_device_menu(self, stdout):
         """device_menu: choosing a number returns that Device"""
         choose_num='2'
-        with mock.patch('builtins.input', return_value=choose_num):
+        with mock.patch(builtin_input, return_value=choose_num):
             result = device_menu()
         # if you hit '2' you should get the corresponding device from the list
         self.assertEqual(len(result), 1)
