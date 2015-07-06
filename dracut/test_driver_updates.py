@@ -349,7 +349,7 @@ class ExtractDriversTestCase(unittest.TestCase):
 
 class GrabDriverFilesTestCase(FileTestCaseBase):
     def test_basic(self):
-        """grab_drivers: copy drivers into place, return module list"""
+        """grab_driver_files: copy drivers into place, return module list"""
         # create a bunch of fake extracted files
         outdir = self.tmpdir + '/extract-outdir'
         moddir = outdir + "/lib/modules/%s/kernel/" % os.uname()[2]
@@ -389,7 +389,7 @@ class LoadDriversTestCase(unittest.TestCase):
         ])
 
 from driver_updates import process_driver_disk
-class ProcessDriverDisk(unittest.TestCase):
+class ProcessDriverDiskTestCase(unittest.TestCase):
     def setUp(self):
         # an iterable that returns fake mountpoints, for mocking mount()
         self.fakemount = ["/mnt/DD-%i" % n for n in range(1,10)]
@@ -415,7 +415,7 @@ class ProcessDriverDisk(unittest.TestCase):
             mock.patch("driver_updates.mounted", return_value=mounted_ctx),
             mock.patch("driver_updates.find_repos", side_effect=self.frepo.get),
             mock.patch("driver_updates.find_isos", side_effect=self.fiso.get),
-            mock.patch("driver_updates.extract_drivers"),
+            mock.patch("driver_updates.extract_drivers", return_value=True),
             mock.patch("driver_updates.load_drivers"),
             mock.patch('driver_updates.grab_driver_files',
                                 side_effect=lambda: self.modlist),
@@ -451,7 +451,13 @@ class ProcessDriverDisk(unittest.TestCase):
         self.mocks['grab_driver_files'].assert_called_once_with()
         self.mocks['load_drivers'].assert_called_once_with(self.modlist)
 
-    # TODO: test_interactive
+    def test_no_drivers(self):
+        """process_driver_disk: don't run depmod etc. if no new drivers"""
+        dev = '/dev/fake'
+        self.mocks['extract_drivers'].return_value = False
+        process_driver_disk(dev)
+        self.assertFalse(self.mocks['grab_driver_files'].called)
+        self.assertFalse(self.mocks['load_drivers'].called)
 
 from driver_updates import finish, mark_finished, all_finished
 
@@ -489,6 +495,7 @@ class FinishedTestCase(FileTestCaseBase):
             finish(r, topdir=self.tmpdir)
         self.assertTrue(os.path.exists(done))
 
+from driver_updates import get_deviceinfo, DeviceInfo
 blkid_output = b'''\
 DEVNAME=/dev/sda2
 UUID=0f21a3d1-dcd3-4ab4-a292-c5556850d561
@@ -511,9 +518,19 @@ disk_labels = {
     '/dev/loop0': 'I\\x20\u262d\\x20COMMUNISM',
     '/dev/sda3': 'metroid_root'
 }
-from driver_updates import get_deviceinfo
+devicelist = [
+    DeviceInfo(DEVNAME='/dev/sda2', TYPE='ext4',
+               UUID='0f21a3d1-dcd3-4ab4-a292-c5556850d561'),
+    DeviceInfo(DEVNAME='/dev/sda1', TYPE='vfat',
+               UUID='C53C-EE46'),
+    DeviceInfo(DEVNAME='/dev/sda3', TYPE='btrfs', LABEL='metroid_root',
+               UUID='4126dbb6-c7d3-47b4-b1fc-9bb461df0067'),
+    DeviceInfo(DEVNAME='/dev/loop0', TYPE='ext4',
+               LABEL='I\\x20\u262d\\x20COMMUNISM',
+               UUID='6f16967e-0388-4276-bd8d-b88e5b217a55'),
+]
 # also covers blkid, get_disk_labels, DeviceInfo
-class TestDeviceInfo(unittest.TestCase):
+class DeviceInfoTestCase(unittest.TestCase):
     @mock.patch('driver_updates.subprocess.check_output')
     @mock.patch('driver_updates.get_disk_labels')
     def test_basic(self, get_disk_labels, check_output):
@@ -526,12 +543,50 @@ class TestDeviceInfo(unittest.TestCase):
         self.assertEqual(len(disks), 4)
         disks.sort(key=lambda d: d.device)
         loop, efi, boot, root = disks
-        self.assertEqual(root.device, '/dev/sda3')
-        self.assertEqual(efi.uuid, 'C53C-EE46')
-        self.assertEqual(boot.fs_type, 'ext4')
-        self.assertEqual(loop.label, 'I\\x20\u262d\\x20COMMUNISM')
+        self.assertEqual(vars(boot), vars(devicelist[0]))
+        self.assertEqual(vars(efi), vars(devicelist[1]))
+        self.assertEqual(vars(root), vars(devicelist[2]))
+        self.assertEqual(vars(loop), vars(devicelist[3]))
 
-# yeab bud let's do this... .. .,,,.
-#from driver_updates import TextMenu, interactive
+# TODO: test TextMenu itself
 
-# NOTE: mock out __builtin__.input and we can script this fokker...
+from driver_updates import device_menu
+from io import StringIO
+class DeviceMenuTestCase(unittest.TestCase):
+    def setUp(self):
+        patches = (
+            mock.patch('driver_updates.get_deviceinfo',return_value=devicelist),
+        )
+        self.mocks = {p.attribute:p.start() for p in patches}
+        for p in patches: self.addCleanup(p.stop)
+
+    def test_device_menu_exit(self):
+        """device_menu: 'c' exits the menu"""
+        with mock.patch('builtins.input', side_effect=['c']):
+            dev = device_menu()
+        self.assertEqual(dev, [])
+        self.assertEqual(self.mocks['get_deviceinfo'].call_count, 1)
+
+    def test_device_menu_refresh(self):
+        """device_menu: 'r' makes the menu refresh"""
+        with mock.patch('builtins.input', side_effect=['r','c']):
+            device_menu()
+        self.assertEqual(self.mocks['get_deviceinfo'].call_count, 2)
+
+    @mock.patch("sys.stdout", new_callable=StringIO)
+    def test_device_menu(self, stdout):
+        """device_menu: choosing a number returns that Device"""
+        choose_num='2'
+        with mock.patch('builtins.input', return_value=choose_num):
+            result = device_menu()
+        # if you hit '2' you should get the corresponding device from the list
+        self.assertEqual(len(result), 1)
+        dev = result[0]
+        self.assertEqual(vars(dev), vars(devicelist[int(choose_num)-1]))
+        # find the corresponding line on-screen
+        screen = [l.strip() for l in stdout.getvalue().splitlines()]
+        match = [l for l in screen if l.startswith(choose_num+')')]
+        self.assertEqual(len(match), 1)
+        line = match.pop(0)
+        # the device name (at least) should be on this line
+        self.assertIn(os.path.basename(dev.device), line)

@@ -222,21 +222,30 @@ def extract_drivers(drivers=None, repos=None, outdir="/updates",
     If any packages containing modules or firmware are extracted, also:
     * call save_repo for that package's repo
     * write the package name(s) to pkglist.
+
+    Returns True if any package containing modules was extracted.
     """
     if not drivers:
         drivers = []
     if repos:
         drivers += [d for d in dd_list(repo) for repo in repos]
+
     save_repos = set()
+    new_drivers = False
+
     for driver in drivers:
         dd_extract(driver.source, outdir)
         # Make sure we install modules/firmware into the target system
         if 'modules' in driver.flags or 'firmwares' in driver.flags:
             append_line(pkglist, driver.name)
             save_repos.add(driver.repo)
+            new_drivers = True
+
     # save the repos containing those packages
     for repo in save_repos:
         save_repo(repo)
+
+    return new_drivers
 
 def grab_driver_files(outdir="/updates"):
     """
@@ -275,11 +284,12 @@ def process_driver_disk(dev, interactive=False):
 
         if repos:
             if interactive:
-                extract_drivers(drivers=repo_menu(repos))
+                new_modules = extract_drivers(drivers=repo_menu(repos))
             else:
-                extract_drivers(repos=repos)
-            modules = grab_driver_files()
-            load_drivers(modules)
+                new_modules = extract_drivers(repos=repos)
+            if new_modules:
+                modules = grab_driver_files()
+                load_drivers(modules)
         elif isos:
             if interactive:
                 isos = iso_menu(isos)
