@@ -1,13 +1,13 @@
 #!/bin/bash
 # parse-anaconda-dd.sh: handle driver update disk settings
 
-# Sets the following variables and files:
-#  $dd_net, /tmp/dd_net: list of URLs to fetch
-#  $dd_disk, /tmp/dd_disk: list of disk devices to load from
-#  $dd_interactive, /tmp/dd_interactive: "menu" if interactive mode requested
+# Creates the following files:
+#  /tmp/dd_net: list of URLs to fetch
+#  /tmp/dd_disk: list of disk devices to load from
+#  /tmp/dd_interactive: "menu" if interactive mode requested
+#  /tmp/dd_todo: concatenation of the above files
 
 # clear everything to ensure idempotency
-unset dd_net dd_disk dd_interactive
 rm -f /tmp/dd_interactive /tmp/dd_net /tmp/dd_disk /tmp/dd_todo
 
 # parse any dd/inst.dd args found
@@ -23,11 +23,6 @@ for dd in $(getargs dd= inst.dd=); do
         *) echo $dd >> /tmp/dd_disk
     esac
 done
-
-# put these in the environment for later hooks
-dd_net="$(cat /tmp/dd_net)"
-dd_disk="$(cat /tmp/dd_disk)"
-dd_interactive="$(cat /tmp/dd_interactive)"
 
 # for convenience's sake, mash 'em all into one list
 cat /tmp/dd_net /tmp/dd_disk /tmp/dd_interactive > /tmp/dd_todo

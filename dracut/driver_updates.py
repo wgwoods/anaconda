@@ -73,6 +73,10 @@ try:
     from subprocess import DEVNULL
 except ImportError:
     DEVNULL = open("/dev/null", 'a+')
+try:
+    _input = raw_input # pylint: disable=undefined-variable
+except NameError:
+    _input = input
 
 log = logging.getLogger("DD")
 
@@ -186,16 +190,18 @@ def ensure_dir(d):
 def move_files(files, destdir):
     """move files into destdir (iff they're not already under destdir)"""
     ensure_dir(destdir)
-    srcfiles = [f for f in files if not f.startswith(destdir)]
-    if srcfiles:
-        subprocess.check_call(["mv", "-f", "-t", destdir] + list(files))
+    for f in files:
+        if f.startswith(destdir):
+            continue
+        subprocess.call(["mv", "-f", f, destdir])
 
 def copy_files(files, destdir):
     """copy files into destdir (iff they're not already under destdir)"""
     ensure_dir(destdir)
-    srcfiles = [f for f in files if not f.startswith(destdir)]
-    if srcfiles:
-        subprocess.check_call(["cp", "-f", "-t", destdir] + srcfiles)
+    for f in files:
+        if f.startswith(destdir):
+            continue
+        subprocess.call(["cp", "-a", f, destdir])
 
 def append_line(filename, line):
     """simple helper to append a line to a file"""
@@ -235,12 +241,15 @@ def extract_drivers(drivers=None, repos=None, outdir="/updates",
     if not drivers:
         drivers = []
     if repos:
-        drivers += [d for d in dd_list(repo) for repo in repos]
+        drivers += [d for repo in repos for d in dd_list(repo)]
 
     save_repos = set()
     new_drivers = False
 
+    ensure_dir(outdir)
+
     for driver in drivers:
+        log.info("Extracting: %s", driver.name)
         dd_extract(driver.source, outdir)
         # Make sure we install modules/firmware into the target system
         if 'modules' in driver.flags or 'firmwares' in driver.flags:
@@ -274,6 +283,12 @@ def load_drivers(modnames):
     subprocess.call(["modprobe", "-a"] + modnames)
 
 def process_driver_disk(dev, interactive=False):
+    try:
+        _process_driver_disk(dev, interactive=interactive)
+    except (subprocess.CalledProcessError, IOError) as e:
+        log.error("ERROR: %s", e)
+
+def _process_driver_disk(dev, interactive=False):
     """
     Main entry point for processing a single driver disk.
     Mount the device/image, find repos, and install drivers from those repos.
@@ -284,8 +299,8 @@ def process_driver_disk(dev, interactive=False):
     If interactive, ask the user which driver(s) to install from the repos,
     or ask which iso file to process (if no repos).
     """
+    log.info("Examining %s", dev)
     with mounted(dev) as mnt:
-        log.info("Examining %s", dev)
         repos = find_repos(mnt)
         isos = find_isos(mnt)
 
@@ -312,7 +327,7 @@ def mark_finished(user_request, topdir="/tmp"):
 def all_finished(topdir="/tmp"):
     finished = read_lines(topdir+"/dd_finished")
     todo = read_lines(topdir+"/dd_todo")
-    return set(finished) == set(todo)
+    return all(r in finished for r in todo)
 
 def finish(user_request, topdir="/tmp"):
     # mark that we've finished processing this request
@@ -474,7 +489,7 @@ class TextMenu(object):
     def run(self):
         while not self.is_done:
             print(self.format_page())
-            k = input(self.format_prompt())
+            k = _input(self.format_prompt())
             action = self.action_dict().get(k)
             if action:
                 action()
@@ -484,6 +499,9 @@ class TextMenu(object):
 
 def repo_menu(repos):
     drivers = [d for r in repos for d in dd_list(r)]
+    if not drivers:
+        log.info("No suitable drivers found.")
+        return []
     menu = TextMenu(drivers, title="Select drivers to install",
                              formatter=lambda d: d.source,
                              multi=True)
@@ -534,23 +552,25 @@ def main(args):
         print_usage()
         raise SystemExit(2)
 
-    if args[0] in ('--disk', '--net'):
+    mode = args.pop(0)
+
+    if mode in ('--disk', '--net'):
         request, dev = args
         process_driver_disk(dev)
-    elif args[0] == '--interactive':
+
+    elif mode == '--interactive':
+        log.info("starting interactive mode")
         request = 'menu'
         while True:
-            try:
-                dev = device_menu()
-                if not dev: break
-                process_driver_disk(dev.pop().device, interactive=True)
-            except (subprocess.CalledProcessError, IOError) as e:
-                log.error("ERROR: %s", e)
-            except KeyboardInterrupt:
-                break
+            dev = device_menu()
+            if not dev: break
+            process_driver_disk(dev.pop().device, interactive=True)
 
     finish(request)
 
 if __name__ == '__main__':
     setup_log()
-    main(sys.argv[1:])
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        log.info("exiting.")

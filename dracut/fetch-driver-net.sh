@@ -17,7 +17,7 @@ while read dd; do
     info "Fetching driverdisk from $dd"
     if driver=$(fetch_url "$dd"); then
         echo "$dd" >> /tmp/dd_net.done # mark it done so we don't fetch it again
-        /bin/driver-updates --net "$dd" "$driver"
+        driver-updates --net "$dd" "$driver"
     else
         warn "Failed to fetch driver from $dd"
     fi
