@@ -325,9 +325,9 @@ class ExtractDriversTestCase(unittest.TestCase):
     @mock.patch("driver_updates.save_repo")
     @mock.patch("driver_updates.append_line")
     @mock.patch("driver_updates.dd_extract")
-    def test_repo(self, mock_extract, mock_append, mock_save):
+    def test_drivers(self, mock_extract, mock_append, mock_save):
         """extract_drivers: save repo, write pkglist"""
-        extract_drivers([fake_enhancement, fake_module])
+        extract_drivers(drivers=[fake_enhancement, fake_module])
         # extracts all listed modules
         mock_extract.assert_has_calls([
             mock.call(fake_enhancement.source, "/updates"),
@@ -340,14 +340,32 @@ class ExtractDriversTestCase(unittest.TestCase):
     @mock.patch("driver_updates.save_repo")
     @mock.patch("driver_updates.append_line")
     @mock.patch("driver_updates.dd_extract")
-    def test_drivers(self, mock_extract, mock_append, mock_save):
+    def test_enhancements(self, mock_extract, mock_append, mock_save):
         """extract_drivers: extract selected drivers, don't save enhancements"""
-        extract_drivers([fake_enhancement])
+        extract_drivers(drivers=[fake_enhancement])
         mock_extract.assert_called_once_with(
             fake_enhancement.source, "/updates"
         )
         self.assertFalse(mock_append.called)
         self.assertFalse(mock_save.called)
+
+    @mock.patch("driver_updates.save_repo")
+    @mock.patch("driver_updates.append_line")
+    @mock.patch("driver_updates.dd_extract")
+    def test_repo(self, mock_extract, mock_append, mock_save):
+        """extract_drivers(repos=[...]) extracts all drivers from named repos"""
+        with mock.patch("driver_updates.dd_list", side_effect=[
+            [fake_enhancement],
+            [fake_enhancement, fake_module]]):
+            extract_drivers(repos=['enh_repo', 'mod_repo'])
+        mock_extract.assert_has_calls([
+            mock.call(fake_enhancement.source, "/updates"),
+            mock.call(fake_enhancement.source, "/updates"),
+            mock.call(fake_module.source, "/updates")
+        ])
+        pkglist = "/run/install/dd_packages"
+        mock_append.assert_called_once_with(pkglist, fake_module.name)
+        mock_save.assert_called_once_with(fake_module.repo)
 
 class GrabDriverFilesTestCase(FileTestCaseBase):
     def test_basic(self):
@@ -473,7 +491,7 @@ class FinishedTestCase(FileTestCaseBase):
         self.assertEqual(read_lines(finished), [requeststr])
 
     def test_all_finished(self):
-        """all_finished: True iff all lines from dd_todo are in dd_finished"""
+        """all_finished: True if all lines from dd_todo are in dd_finished"""
         todo = self.tmpdir+'/dd_todo'
         requests = ['one', 'two', 'final thingy']
         with open(todo, 'w') as outf:
@@ -482,6 +500,12 @@ class FinishedTestCase(FileTestCaseBase):
         for r in reversed(requests):
             self.assertFalse(all_finished(topdir=self.tmpdir))
             mark_finished(r, topdir=self.tmpdir)
+        self.assertTrue(all_finished(topdir=self.tmpdir))
+
+    def test_extra_finished(self):
+        """all_finished: True if dd_finished has more items than dd_todo"""
+        self.test_all_finished()
+        mark_finished("BONUS", topdir=self.tmpdir)
         self.assertTrue(all_finished(topdir=self.tmpdir))
 
     def test_finish(self):
@@ -558,7 +582,6 @@ if sys.version_info.major == 3:
     from io import StringIO
 else:
     from io import BytesIO as StringIO
-builtin_input = input.__module__ + '.input'
 
 from driver_updates import device_menu
 class DeviceMenuTestCase(unittest.TestCase):
@@ -571,14 +594,14 @@ class DeviceMenuTestCase(unittest.TestCase):
 
     def test_device_menu_exit(self):
         """device_menu: 'c' exits the menu"""
-        with mock.patch(builtin_input, side_effect=['c']):
+        with mock.patch('driver_updates._input', side_effect=['c']):
             dev = device_menu()
         self.assertEqual(dev, [])
         self.assertEqual(self.mocks['get_deviceinfo'].call_count, 1)
 
     def test_device_menu_refresh(self):
         """device_menu: 'r' makes the menu refresh"""
-        with mock.patch(builtin_input, side_effect=['r','c']):
+        with mock.patch('driver_updates._input', side_effect=['r','c']):
             device_menu()
         self.assertEqual(self.mocks['get_deviceinfo'].call_count, 2)
 
@@ -586,7 +609,7 @@ class DeviceMenuTestCase(unittest.TestCase):
     def test_device_menu(self, stdout):
         """device_menu: choosing a number returns that Device"""
         choose_num='2'
-        with mock.patch(builtin_input, return_value=choose_num):
+        with mock.patch('driver_updates._input', return_value=choose_num):
             result = device_menu()
         # if you hit '2' you should get the corresponding device from the list
         self.assertEqual(len(result), 1)
